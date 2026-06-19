@@ -1,881 +1,613 @@
-import streamlit as st
+"""
+Project Nandi — Sprayer Coverage Simulator
+===========================================
+A single-file Streamlit tool for an autonomous weeding / spot-spraying robot.
+
+It models:
+  1. Static boom coverage (rasterized union / overlap / gap engine)
+  2. Camera FOV & look-ahead geometry (near/far edge, time-to-boom)
+  3. Performance / "ARCES" analysis (latency-bound Vmax, acre timing)
+
+Stack: streamlit, numpy, pandas, plotly.graph_objects
+Author: R&D Perception Engineering
+"""
+
+import math
+import numpy as np
 import pandas as pd
-import re
-import io
-from collections import defaultdict
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
-from openpyxl.formatting.rule import ColorScaleRule, CellIsRule
+import plotly.graph_objects as go
+import streamlit as st
 
-# ─── PAGE CONFIG ───────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# Page + lightweight theme tokens (kept consistent across all Plotly charts)
+# --------------------------------------------------------------------------- #
 st.set_page_config(
-    page_title="CAN Bus Analyzer",
-    page_icon="🚌",
+    page_title="Sprayer Coverage Simulator",
+    page_icon="🌱",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
-# ─── THEME CSS ─────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-/* Dark engineering feel */
-:root {
-    --bg-deep: #0d1117;
-    --bg-card: #161b22;
-    --bg-panel: #1c2128;
-    --accent: #58a6ff;
-    --accent2: #3fb950;
-    --accent3: #f78166;
-    --accent4: #d2a8ff;
-    --text: #e6edf3;
-    --text-dim: #8b949e;
-    --border: #30363d;
-    --tx-color: #3fb950;
-    --rx-color: #58a6ff;
-    --ext-color: #d2a8ff;
-    --rem-color: #e3b341;
-}
+C_ACTIVE = "rgba(34, 160, 80, 0.30)"      # green fill (active nozzle)
+C_ACTIVE_L = "rgba(34, 160, 80, 0.95)"    # green line
+C_OFF = "rgba(150, 150, 150, 0.18)"       # gray fill (inactive nozzle)
+C_OFF_L = "rgba(120, 120, 120, 0.75)"     # gray line
+C_GAP = "rgba(220, 40, 40, 0.28)"         # red fill (gap)
+C_GAP_L = "rgba(200, 20, 20, 0.95)"
+C_CAM = "rgba(30, 110, 200, 0.22)"        # blue fill (camera FOV)
+C_CAM_L = "rgba(30, 110, 200, 0.95)"
+C_GROUND = "rgba(90, 70, 50, 0.9)"
+C_BOOM = "rgba(40, 40, 40, 0.95)"
 
-/* Hide default streamlit chrome */
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
+PLOT_BG = "rgba(0,0,0,0)"
+ACRE_M2 = 4046.86  # 1 international acre in square metres
 
-/* Main background */
-.stApp { background: var(--bg-deep); }
-section[data-testid="stSidebar"] { background: var(--bg-card) !important; border-right: 1px solid var(--border); }
-
-/* Sidebar header */
-.sidebar-logo {
-    font-size: 1.3rem; font-weight: 700; color: var(--accent);
-    padding: 0.5rem 0 1rem 0; letter-spacing: 0.05em;
-    border-bottom: 1px solid var(--border); margin-bottom: 1rem;
-}
-
-/* KPI cards */
-.kpi-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 1rem; }
-.kpi-card {
-    flex: 1; min-width: 130px;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px 16px;
-    text-align: center;
-}
-.kpi-card.tx { border-top: 3px solid var(--tx-color); }
-.kpi-card.rx { border-top: 3px solid var(--rx-color); }
-.kpi-card.ext { border-top: 3px solid var(--ext-color); }
-.kpi-card.total { border-top: 3px solid var(--accent); }
-.kpi-card.ids { border-top: 3px solid var(--accent4); }
-.kpi-card.dur { border-top: 3px solid var(--rem-color); }
-
-.kpi-val { font-size: 1.7rem; font-weight: 700; color: var(--text); line-height: 1.1; }
-.kpi-label { font-size: 0.72rem; color: var(--text-dim); margin-top: 3px; text-transform: uppercase; letter-spacing: 0.05em; }
-
-/* Section headers */
-.sec-header {
-    font-size: 0.8rem; font-weight: 600; color: var(--text-dim);
-    text-transform: uppercase; letter-spacing: 0.08em;
-    padding: 0.5rem 0 0.3rem 0;
-    border-bottom: 1px solid var(--border);
-    margin: 0.5rem 0 0.8rem 0;
-}
-
-/* ID badge pills */
-.id-pill {
-    display: inline-block;
-    background: #1f2937; border: 1px solid var(--border);
-    border-radius: 4px; padding: 1px 6px;
-    font-family: monospace; font-size: 0.8rem; color: var(--accent);
-    font-weight: 600;
-}
-
-/* Direction badges */
-.badge-tx { background:#0d2818; color:#3fb950; border:1px solid #3fb950; border-radius:3px; padding:1px 6px; font-size:0.75rem; font-weight:700; }
-.badge-rx { background:#0c1e35; color:#58a6ff; border:1px solid #58a6ff; border-radius:3px; padding:1px 6px; font-size:0.75rem; font-weight:700; }
-
-/* Frame type badges */
-.badge-std { background:#1a1a2e; color:#c3c3e0; border:1px solid #444; border-radius:3px; padding:1px 5px; font-size:0.7rem; }
-.badge-ext { background:#1e1030; color:#d2a8ff; border:1px solid #7c4dff; border-radius:3px; padding:1px 5px; font-size:0.7rem; }
-.badge-rem { background:#1e1500; color:#e3b341; border:1px solid #e3b341; border-radius:3px; padding:1px 5px; font-size:0.7rem; }
-
-/* Info box */
-.info-box {
-    background: var(--bg-panel); border: 1px solid var(--border);
-    border-left: 3px solid var(--accent);
-    border-radius: 6px; padding: 0.8rem 1rem;
-    font-size: 0.85rem; color: var(--text-dim); margin-bottom: 1rem;
-}
-
-/* Byte grid */
-.byte-grid {
-    display: flex; gap: 4px; flex-wrap: wrap; font-family: monospace;
-}
-.byte-cell {
-    width: 34px; height: 28px; display: flex; align-items: center;
-    justify-content: center; border-radius: 4px;
-    font-size: 0.75rem; font-weight: 600;
-}
-.byte-zero { background: #1c2128; color: #444d56; border: 1px solid #30363d; }
-.byte-nonzero { background: #132b1e; color: #3fb950; border: 1px solid #3fb950; }
-
-/* Metric deltas override */
-[data-testid="stMetricDelta"] { font-size: 0.7rem; }
-
-/* Tab styling */
-.stTabs [data-baseweb="tab-list"] {
-    background: var(--bg-card);
-    border-bottom: 1px solid var(--border);
-    gap: 4px;
-}
-.stTabs [data-baseweb="tab"] {
-    background: transparent; color: var(--text-dim);
-    border: none; font-size: 0.82rem; font-weight: 500;
-}
-.stTabs [aria-selected="true"] {
-    background: var(--bg-panel) !important; color: var(--accent) !important;
-    border-bottom: 2px solid var(--accent) !important;
-}
-
-/* Upload zone */
-[data-testid="stFileUploader"] {
-    background: var(--bg-card);
-    border: 2px dashed var(--border);
-    border-radius: 8px;
-}
-
-/* Dataframe */
-[data-testid="stDataFrame"] { border-radius: 8px; }
-
-/* Sidebar filter labels */
-.filter-label {
-    font-size: 0.72rem; font-weight: 600; color: var(--text-dim);
-    text-transform: uppercase; letter-spacing: 0.06em;
-    margin-bottom: 2px;
-}
-
-/* Session info table */
-.meta-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-.meta-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); color: var(--text); }
-.meta-table td:first-child { color: var(--text-dim); font-size: 0.75rem; text-transform: uppercase; letter-spacing:0.04em; width: 40%; }
-
-/* Timing table */
-.timing-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; padding: 6px 10px; background: var(--bg-panel); border-radius: 6px; border: 1px solid var(--border); }
-.timing-id { font-family: monospace; font-weight: 700; color: var(--accent); min-width: 110px; font-size: 0.85rem; }
-.timing-bar-wrap { flex: 1; background: #21262d; border-radius: 3px; height: 8px; overflow: hidden; }
-.timing-bar { height: 100%; border-radius: 3px; background: linear-gradient(90deg, #58a6ff, #3fb950); }
-.timing-val { font-size: 0.78rem; color: var(--text-dim); min-width: 80px; text-align: right; }
-
-/* Warning banner */
-.warn-banner {
-    background: #2d1e00; border: 1px solid #e3b341; border-left: 3px solid #e3b341;
-    border-radius: 6px; padding: 8px 12px; font-size: 0.82rem; color: #e3b341; margin-bottom: 8px;
-}
-
-/* Download button override */
-.stDownloadButton > button {
-    background: linear-gradient(90deg, #1a5276, #1a3a5c) !important;
-    color: #58a6ff !important;
-    border: 1px solid #58a6ff !important;
-    border-radius: 6px !important;
-    font-weight: 600 !important;
-    width: 100% !important;
-}
-.stDownloadButton > button:hover {
-    background: linear-gradient(90deg, #1f6391, #1a4a7c) !important;
-}
-</style>
-""", unsafe_allow_html=True)
+ENGINE_GRID_RES = 3.0       # mm per raster cell (nominal)
+ENGINE_MAX_CELLS = 1_800_000  # safety cap on raster size
 
 
-# ─── PARSER ────────────────────────────────────────────────────────────────────
-def parse_can_log(content: str):
-    lines = content.splitlines()
-    meta, rows = {}, []
+# --------------------------------------------------------------------------- #
+# CORE ENGINE — rasterized coverage of an arbitrary nozzle array
+# --------------------------------------------------------------------------- #
+def compute_coverage(x_centers_mm, active, nozzle_type, swath_w_mm,
+                     fan_thickness_mm, grid_res=ENGINE_GRID_RES):
+    """
+    Rasterize the ground footprints of a nozzle array and measure coverage.
 
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("***"):
-            m = re.match(r"\*\*\*START DATE AND TIME (.+?)\*\*\*", line)
-            if m: meta["Date / Time"] = m.group(1).strip()
-            m = re.match(r"\*\*\*PROTOCOL (.+?)\*\*\*", line)
-            if m: meta["Protocol"] = m.group(1).strip()
-            m = re.match(r"\*\*\*BUSMASTER Ver (.+?)\*\*\*", line)
-            if m: meta["Logger"] = "BUSMASTER v" + m.group(1).strip()
-            if "500000 bps" in line or "bps" in line:
-                m = re.search(r"(\d+ bps)", line)
-                if m: meta["Baud Rate"] = m.group(1)
-            m = re.search(r"Kvaser[^,]+", line)
-            if m: meta["Interface"] = m.group(0).strip()
-            m = re.search(r"Serial Number- (\S+)", line)
-            if m: meta["Serial No."] = m.group(1)
-            if "SYSTEM MODE" in line: meta["Mode"] = "System Mode"
-            if "HEX" in line and "DATABASE" not in line: meta["Display Format"] = "HEX"
-            continue
+    Parameters
+    ----------
+    x_centers_mm : (N,) array  -> across-boom centre position of each nozzle (mm)
+    active       : (N,) bool   -> nozzle ON/OFF state
+    nozzle_type  : "Flat Fan" (rectangular footprint) | "Conical" (circular)
+    swath_w_mm   : ground width of one nozzle footprint (mm) = 2*H*tan(angle/2)
+    fan_thickness_mm : pass-direction depth of a flat-fan footprint (mm)
+    grid_res     : raster resolution (mm/cell)
 
-        parts = line.split()
-        if len(parts) < 6:
-            continue
-        ts_str = parts[0]
-        direction = parts[1]
-        channel   = parts[2]
-        can_id    = parts[3]
-        ft_raw    = parts[4]
-        try:
-            dlc = int(parts[5])
-        except ValueError:
-            dlc = 0
-        data_bytes = parts[6:]
+    Returns a dict with raw / union / overlap areas (m^2), per-nozzle table
+    (footprint / unique / shared in m^2) and horizontal gap segments (mm).
+    """
+    x_centers_mm = np.asarray(x_centers_mm, dtype=float)
+    active = np.asarray(active, dtype=bool)
+    n = len(x_centers_mm)
+    radius = swath_w_mm / 2.0
 
-        m = re.match(r"(\d+):(\d+):(\d+):(\d+)", ts_str)
-        if m:
-            h, mi, s, ms = map(int, m.groups())
-            ts_ms = h*3600000 + mi*60000 + s*1000 + ms
+    out = {
+        "n_total": n,
+        "n_active": int(active.sum()),
+        "raw_area_m2": 0.0,
+        "union_area_m2": 0.0,
+        "overlap_area_m2": 0.0,
+        "overlap_pct": 0.0,
+        "per_nozzle": [0.0] * n,        # footprint area (m^2) per nozzle index
+        "unique": [0.0] * n,
+        "shared": [0.0] * n,
+        "gaps_mm": [],                  # list of (x_start, x_end, width)
+        "covered_x_span_mm": 0.0,
+        "grid_res": grid_res,
+    }
+
+    act_idx = np.where(active)[0]
+    if len(act_idx) == 0 or radius <= 0:
+        return out
+
+    # ---- bounding box of the ACTIVE footprints ----
+    xmin = float((x_centers_mm[act_idx] - radius).min())
+    xmax = float((x_centers_mm[act_idx] + radius).max())
+    if nozzle_type == "Conical":
+        ymin, ymax = -radius, radius
+    else:  # Flat Fan
+        half_t = max(fan_thickness_mm, grid_res) / 2.0
+        ymin, ymax = -half_t, half_t
+
+    width_mm = xmax - xmin
+    depth_mm = ymax - ymin
+
+    # ---- adaptive resolution so the raster never explodes ----
+    cells_est = (width_mm / grid_res) * (depth_mm / grid_res)
+    if cells_est > ENGINE_MAX_CELLS:
+        grid_res = math.sqrt(width_mm * depth_mm / ENGINE_MAX_CELLS)
+    out["grid_res"] = grid_res
+
+    nx = max(int(math.ceil(width_mm / grid_res)), 1)
+    ny = max(int(math.ceil(depth_mm / grid_res)), 1)
+    cell_area_m2 = (grid_res ** 2) / 1.0e6
+
+    xs = xmin + (np.arange(nx) + 0.5) * grid_res      # cell-centre x (mm)
+    ys = ymin + (np.arange(ny) + 0.5) * grid_res      # cell-centre y (mm)
+    X, Y = np.meshgrid(xs, ys)                        # (ny, nx)
+
+    # ---- pass 1: coverage count grid ----
+    count = np.zeros((ny, nx), dtype=np.int16)
+    masks = {}
+    for i in act_idx:
+        cx = x_centers_mm[i]
+        if nozzle_type == "Conical":
+            m = (X - cx) ** 2 + Y ** 2 <= radius ** 2
         else:
-            ts_ms = None
+            m = np.abs(X - cx) <= radius           # full depth strip
+        masks[i] = m
+        count += m
 
-        if "sr" in ft_raw:
-            frame_type = "Remote"
-        elif "x" in ft_raw:
-            frame_type = "Extended"
-        else:
-            frame_type = "Standard"
+    covered = count >= 1
+    union_cells = int(covered.sum())
+    union_area = union_cells * cell_area_m2
 
-        byte_dict = {f"B{i}": (data_bytes[i] if i < len(data_bytes) else "--") for i in range(8)}
-        data_hex = " ".join(data_bytes) if data_bytes else "-- -- -- -- -- -- -- --"
+    # ---- pass 2: per-nozzle unique / shared ----
+    raw_area = 0.0
+    for i in act_idx:
+        m = masks[i]
+        fp_cells = int(m.sum())
+        uniq_cells = int((m & (count == 1)).sum())
+        fp = fp_cells * cell_area_m2
+        uq = uniq_cells * cell_area_m2
+        out["per_nozzle"][i] = fp
+        out["unique"][i] = uq
+        out["shared"][i] = fp - uq
+        raw_area += fp
 
-        rows.append({
-            "Timestamp":     ts_str,
-            "ts_ms":         ts_ms,
-            "Direction":     direction,
-            "Channel":       channel,
-            "CAN ID":        can_id,
-            "Frame":         frame_type,
-            "DLC":           dlc,
-            "Data (Hex)":    data_hex,
-            **byte_dict,
-        })
+    overlap_area = max(raw_area - union_area, 0.0)
+    out["raw_area_m2"] = raw_area
+    out["union_area_m2"] = union_area
+    out["overlap_area_m2"] = overlap_area
+    out["overlap_pct"] = (overlap_area / raw_area * 100.0) if raw_area > 0 else 0.0
+    out["covered_x_span_mm"] = width_mm
 
-    df = pd.DataFrame(rows)
-    if not df.empty and df["ts_ms"].notna().any():
-        t0 = df["ts_ms"].min()
-        df["Rel Time (ms)"] = (df["ts_ms"] - t0).round(1)
-    else:
-        df["Rel Time (ms)"] = None
-    return meta, df
-
-
-# ─── TIMING ANALYSIS ───────────────────────────────────────────────────────────
-def timing_analysis(df: pd.DataFrame):
-    results = []
-    for cid, grp in df.groupby("CAN ID"):
-        grp = grp.sort_values("ts_ms").copy()
-        diffs = grp["ts_ms"].diff().dropna()
-        if len(diffs) < 2:
-            continue
-        results.append({
-            "CAN ID":        cid,
-            "Direction":     grp["Direction"].mode()[0],
-            "Frame":         grp["Frame"].mode()[0],
-            "Count":         len(grp),
-            "Mean (ms)":     round(diffs.mean(), 2),
-            "Min (ms)":      round(diffs.min(), 2),
-            "Max (ms)":      round(diffs.max(), 2),
-            "Std Dev (ms)":  round(diffs.std(), 2),
-            "Est. Period":   f"~{round(diffs.mean())} ms",
-            "Est. Freq":     f"{round(1000/diffs.mean(), 1)} Hz" if diffs.mean() > 0 else "-",
-            "Jitter (ms)":   round(diffs.std(), 2),
-        })
-    return pd.DataFrame(results)
+    # ---- horizontal gaps: x-columns NEVER covered (untreated crop strips) ----
+    col_covered = covered.any(axis=0)        # (nx,) any y covered for this x
+    interior = np.where(col_covered)[0]
+    if len(interior) > 0:
+        lo, hi = interior.min(), interior.max()
+        gap_open = None
+        for c in range(lo, hi + 1):
+            if not col_covered[c] and gap_open is None:
+                gap_open = c
+            elif col_covered[c] and gap_open is not None:
+                xs_g = xmin + gap_open * grid_res
+                xe_g = xmin + c * grid_res
+                out["gaps_mm"].append((xs_g, xe_g, xe_g - xs_g))
+                gap_open = None
+    return out
 
 
-# ─── EXCEL EXPORT ──────────────────────────────────────────────────────────────
-def build_excel(meta, df):
-    wb = Workbook()
-
-    C_DARK="0D1117"; C_CARD="161B22"; C_HDR="1C2128"
-    C_ACCENT="58A6FF"; C_TX="3FB950"; C_RX="58A6FF"
-    C_TEXT="E6EDF3"; C_DIM="8B949E"; C_BORDER="30363D"
-    C_ROW1="161B22"; C_ROW2="1C2128"
-
-    thin=Side(style="thin",color=C_BORDER)
-    brd=Border(left=thin,right=thin,top=thin,bottom=thin)
-
-    def hf(sz=10,bold=True,color=C_TEXT): return Font(name="Consolas",size=sz,bold=bold,color=color)
-    def bf(sz=9,bold=False,color=C_TEXT): return Font(name="Consolas",size=sz,bold=bold,color=color)
-    def fl(c): return PatternFill("solid",fgColor=c)
-    def ac(): return Alignment(horizontal="center",vertical="center")
-    def al(): return Alignment(horizontal="left",vertical="center")
-    def ar(): return Alignment(horizontal="right",vertical="center")
-
-    def make_title(ws, text, ncols, bg=C_DARK):
-        ws.merge_cells(f"A1:{get_column_letter(ncols)}1")
-        c=ws["A1"]; c.value=text
-        c.font=Font(name="Consolas",size=13,bold=True,color=C_ACCENT)
-        c.fill=fl(bg); c.alignment=al(); ws.row_dimensions[1].height=28
-
-    def make_header(ws, cols, row=2):
-        for ci,(name,w) in enumerate(cols,1):
-            c=ws.cell(row=row,column=ci,value=name)
-            c.font=hf(9); c.fill=fl(C_HDR); c.alignment=ac(); c.border=brd
-            ws.column_dimensions[get_column_letter(ci)].width=w
-        ws.row_dimensions[row].height=20
-
-    def write_df_rows(ws, dataframe, col_defs, start_row=3, tx_green=False):
-        """Write a DataFrame to a worksheet safely using iloc."""
-        col_names = [c[0] for c in col_defs]
-        df_cols = list(dataframe.columns)
-        for ri, (_, row) in enumerate(dataframe.iterrows(), start=start_row):
-            d = row.get("Direction","")
-            if tx_green:
-                bg = ("0D2818" if ri%2==0 else "132b1e") if d=="Tx" else ("0C1E35" if ri%2==0 else "0f1e33")
-            else:
-                bg = C_ROW2 if ri%2==0 else C_ROW1
-            txt_color = C_TX if d=="Tx" else (C_RX if d=="Rx" else C_TEXT)
-            for ci, cname in enumerate(col_names, 1):
-                # Map display col name back to dataframe col
-                mapped = {"Dir":"Direction","Ch":"Channel","B0":"B0","B1":"B1","B2":"B2",
-                          "B3":"B3","B4":"B4","B5":"B5","B6":"B6","B7":"B7"}.get(cname, cname)
-                val = row.get(mapped, "") if mapped in df_cols else ""
-                if val is None: val = ""
-                cell = ws.cell(ri, ci, val)
-                cell.font = bf(9, color=txt_color if cname in ("CAN ID","Dir","Direction") else C_TEXT)
-                cell.fill = fl(bg)
-                cell.alignment = al() if cname in ("Timestamp","Data (Hex)","Rel Time (ms)") else ac()
-                cell.border = brd
-
-    # ── Sheet 1: Summary ──
-    ws = wb.active; ws.title = "Summary"
-    ws.sheet_view.showGridLines = False
-    ws.column_dimensions["A"].width = 28
-    ws.column_dimensions["B"].width = 38
-    make_title(ws, "  CAN BUS LOG — ANALYSIS REPORT", 2)
-
-    r=3
-    ws.merge_cells(f"A{r}:B{r}")
-    lbl=ws.cell(r,1,"SESSION INFO"); lbl.font=hf(8,color=C_DIM); lbl.fill=fl(C_HDR); lbl.alignment=al(); r+=1
-    for k,v in meta.items():
-        ws.cell(r,1,k).font=bf(color=C_DIM); ws.cell(r,1).fill=fl(C_ROW2); ws.cell(r,1).border=brd; ws.cell(r,1).alignment=al()
-        ws.cell(r,2,str(v)).font=bf(bold=True); ws.cell(r,2).fill=fl(C_ROW1); ws.cell(r,2).border=brd; ws.cell(r,2).alignment=al()
-        r+=1
-
-    r+=1
-    ws.merge_cells(f"A{r}:B{r}")
-    ws.cell(r,1,"LOG STATISTICS").font=hf(8,color=C_DIM); ws.cell(r,1).fill=fl(C_HDR); ws.cell(r,1).alignment=al(); r+=1
-
-    dur_ms = df["ts_ms"].max()-df["ts_ms"].min() if df["ts_ms"].notna().any() else 0
-    dur_s  = dur_ms/1000
-    stats=[
-        ("Total Messages",       len(df)),
-        ("Transmitted (Tx)",     len(df[df["Direction"]=="Tx"])),
-        ("Received (Rx)",        len(df[df["Direction"]=="Rx"])),
-        ("Unique CAN IDs",       df["CAN ID"].nunique()),
-        ("Standard Frames",      len(df[df["Frame"]=="Standard"])),
-        ("Extended Frames",      len(df[df["Frame"]=="Extended"])),
-        ("Remote Frames",        len(df[df["Frame"]=="Remote"])),
-        ("Log Duration (s)",     round(dur_s,3)),
-        ("Avg Msg Rate (msg/s)", round(len(df)/dur_s,1) if dur_s>0 else "-"),
-        ("Most Active CAN ID",   df["CAN ID"].value_counts().index[0]),
-    ]
-    for k,v in stats:
-        ws.cell(r,1,k).font=bf(color=C_DIM); ws.cell(r,1).fill=fl(C_ROW2); ws.cell(r,1).border=brd; ws.cell(r,1).alignment=al()
-        ws.cell(r,2,str(v)).font=bf(bold=True,color=C_ACCENT); ws.cell(r,2).fill=fl(C_ROW1); ws.cell(r,2).border=brd; ws.cell(r,2).alignment=ar()
-        r+=1
-
-    # ── Sheet 2: All Messages ──
-    ws2 = wb.create_sheet("All Messages")
-    ws2.sheet_view.showGridLines=False; ws2.freeze_panes="A3"
-    msg_cols=[("Timestamp",18),("Rel Time (ms)",14),("Dir",6),("Ch",5),("CAN ID",13),
-              ("Frame",11),("DLC",5),("Data (Hex)",26),
-              ("B0",7),("B1",7),("B2",7),("B3",7),("B4",7),("B5",7),("B6",7),("B7",7)]
-    make_title(ws2,"  ALL CAN MESSAGES — "+str(len(df))+" ROWS",len(msg_cols))
-    make_header(ws2, msg_cols)
-    ws2.auto_filter.ref=f"A2:{get_column_letter(len(msg_cols))}2"
-
-    # Build display df with renamed cols
-    exp_df = df.rename(columns={"Direction":"Dir","Channel":"Ch"})[
-        ["Timestamp","Rel Time (ms)","Dir","Ch","CAN ID","Frame","DLC","Data (Hex)",
-         "B0","B1","B2","B3","B4","B5","B6","B7"]
-    ].copy()
-    exp_df["Dir"] = df["Direction"]  # keep for color logic
-    # add Direction back for color
-    exp_df2 = exp_df.copy()
-    exp_df2["Direction"] = df["Direction"].values
-
-    for ri,(_, row) in enumerate(exp_df2.iterrows(), start=3):
-        d = row.get("Direction","")
-        bg = ("0D2818" if ri%2==0 else "132b1e") if d=="Tx" else ("0C1E35" if ri%2==0 else "0f1e33")
-        cols_in_sheet = [c[0] for c in msg_cols]
-        for ci, cname in enumerate(cols_in_sheet, 1):
-            val = row.get(cname, "")
-            if val is None: val = ""
-            cell = ws2.cell(ri, ci, val)
-            cell.font = bf(9, color=C_TX if d=="Tx" else C_TEXT)
-            cell.fill = fl(bg)
-            cell.alignment = al() if cname in ("Timestamp","Data (Hex)","Rel Time (ms)") else ac()
-            cell.border = brd
-
-    # ── Sheet 3: Timing Analysis ──
-    ws3=wb.create_sheet("Timing Analysis")
-    ws3.sheet_view.showGridLines=False; ws3.freeze_panes="A3"
-    t_cols=[("CAN ID",14),("Direction",10),("Frame",12),("Count",8),
-            ("Mean (ms)",11),("Min (ms)",10),("Max (ms)",10),("Std Dev (ms)",12),
-            ("Est. Period",13),("Est. Freq",11),("Jitter (ms)",11)]
-    make_title(ws3,"  TIMING ANALYSIS — PER CAN ID",len(t_cols))
-    make_header(ws3, t_cols)
-    ta=timing_analysis(df)
-
-    if not ta.empty:
-        mean_max=ta["Mean (ms)"].max(); jit_max=ta["Jitter (ms)"].max()
-        for ri,(_, row) in enumerate(ta.iterrows(), start=3):
-            bg=C_ROW2 if ri%2==0 else C_ROW1
-            for ci,cname in enumerate([c[0] for c in t_cols],1):
-                val=row.get(cname,"")
-                if val is None: val=""
-                cell=ws3.cell(ri,ci,val)
-                # Manual color scale — no matplotlib
-                if cname=="Mean (ms)" and isinstance(val,(int,float)) and mean_max>0:
-                    ratio=min(val/mean_max,1.0)
-                    r_=int(30+ratio*200); g_=int(180-ratio*130)
-                    cell.fill=PatternFill("solid",fgColor=f"{r_:02X}{g_:02X}32")
-                elif cname=="Jitter (ms)" and isinstance(val,(int,float)) and jit_max>0:
-                    ratio=min(val/jit_max,1.0)
-                    r_=int(30+ratio*220); g_=int(60-ratio*40)
-                    cell.fill=PatternFill("solid",fgColor=f"{r_:02X}{g_:02X}32")
-                else:
-                    cell.fill=fl(bg)
-                cell.font=bf(9,color=C_ACCENT if cname=="CAN ID" else C_TEXT)
-                cell.alignment=ac(); cell.border=brd
-
-    # ── Sheet 4: ID Breakdown ──
-    ws4=wb.create_sheet("ID Breakdown")
-    ws4.sheet_view.showGridLines=False; ws4.freeze_panes="A3"
-    b_cols=[("CAN ID",14),("Total",8),("Tx",7),("Rx",7),("Frame Type",14),
-            ("% Traffic",11),("Unique Payloads",16),("First Seen",18),("Last Seen",18)]
-    make_title(ws4,"  CAN ID TRAFFIC BREAKDOWN",len(b_cols))
-    make_header(ws4, b_cols)
-    total=len(df)
-    for ri,(cid,grp) in enumerate(df.groupby("CAN ID"),start=3):
-        bg=C_ROW2 if ri%2==0 else C_ROW1
-        pct=round(len(grp)/total*100,1)
-        vals=[cid,len(grp),len(grp[grp["Direction"]=="Tx"]),len(grp[grp["Direction"]=="Rx"]),
-              grp["Frame"].mode()[0] if not grp.empty else "-",f"{pct}%",
-              grp["Data (Hex)"].nunique(),grp["Timestamp"].iloc[0],grp["Timestamp"].iloc[-1]]
-        for ci,v in enumerate(vals,1):
-            cell=ws4.cell(ri,ci,v)
-            cell.font=bf(9,color=C_ACCENT if ci==1 else C_TEXT)
-            cell.fill=fl(bg); cell.alignment=ac(); cell.border=brd
-    ws4.auto_filter.ref=f"A2:{get_column_letter(len(b_cols))}{len(df.groupby('CAN ID'))+2}"
-
-    # ── Sheet 5: Tx Messages ──
-    ws5=wb.create_sheet("Tx Messages")
-    ws5.sheet_view.showGridLines=False; ws5.freeze_panes="A3"
-    make_title(ws5,"  TRANSMITTED (Tx) MESSAGES",len(msg_cols),"0D2818")
-    make_header(ws5, msg_cols)
-    ws5.auto_filter.ref=f"A2:{get_column_letter(len(msg_cols))}2"
-    tx_df=df[df["Direction"]=="Tx"].reset_index(drop=True)
-    for ri,(_, row) in enumerate(tx_df.iterrows(), start=3):
-        bg="0D2818" if ri%2==0 else "132b1e"
-        cols_in_sheet=[c[0] for c in msg_cols]
-        for ci,cname in enumerate(cols_in_sheet,1):
-            mapped={"Dir":"Direction","Ch":"Channel"}.get(cname,cname)
-            val=row.get(mapped,"")
-            if val is None: val=""
-            if cname=="Dir": val="Tx"
-            cell=ws5.cell(ri,ci,val)
-            cell.font=bf(9,color=C_TX); cell.fill=fl(bg)
-            cell.alignment=al() if cname in ("Timestamp","Data (Hex)","Rel Time (ms)") else ac()
-            cell.border=brd
-
-    # ── Sheet 6: Rx Messages ──
-    ws6=wb.create_sheet("Rx Messages")
-    ws6.sheet_view.showGridLines=False; ws6.freeze_panes="A3"
-    make_title(ws6,"  RECEIVED (Rx) MESSAGES",len(msg_cols),"0C1E35")
-    make_header(ws6, msg_cols)
-    ws6.auto_filter.ref=f"A2:{get_column_letter(len(msg_cols))}2"
-    rx_df=df[df["Direction"]=="Rx"].reset_index(drop=True)
-    for ri,(_, row) in enumerate(rx_df.iterrows(), start=3):
-        bg="0C1E35" if ri%2==0 else "0f1e33"
-        for ci,cname in enumerate([c[0] for c in msg_cols],1):
-            mapped={"Dir":"Direction","Ch":"Channel"}.get(cname,cname)
-            val=row.get(mapped,"")
-            if val is None: val=""
-            if cname=="Dir": val="Rx"
-            cell=ws6.cell(ri,ci,val)
-            cell.font=bf(9,color=C_RX); cell.fill=fl(bg)
-            cell.alignment=al() if cname in ("Timestamp","Data (Hex)","Rel Time (ms)") else ac()
-            cell.border=brd
-
-    buf=io.BytesIO(); wb.save(buf); return buf.getvalue()
+# --------------------------------------------------------------------------- #
+# Geometry helpers
+# --------------------------------------------------------------------------- #
+def swath_from_geometry(height_mm, angle_deg):
+    """Ground width of a single nozzle footprint from boom height + spray angle."""
+    a = math.radians(min(max(angle_deg, 1.0), 178.0) / 2.0)
+    return 2.0 * height_mm * math.tan(a)
 
 
-# ─── SIDEBAR ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown('<div class="sidebar-logo">🚌 CAN Analyzer</div>', unsafe_allow_html=True)
-
-    uploaded = st.file_uploader(
-        "Upload BUSMASTER Log",
-        type=["log","txt"],
-        label_visibility="collapsed",
-        help="BUSMASTER .log / .txt format"
-    )
-
-    st.markdown('<div class="sec-header">⚙️ Filters</div>', unsafe_allow_html=True)
-    filter_placeholder = st.empty()
-    st.markdown("---")
-    st.markdown('<div class="sec-header">ℹ️ About</div>', unsafe_allow_html=True)
-    st.markdown("""
-<div style="font-size:0.75rem;color:#8b949e;line-height:1.6;">
-Parses <b>BUSMASTER</b> CAN logs.<br>
-Supports Standard, Extended (29-bit), and Remote frames.<br><br>
-Excel export includes:<br>
-• Summary sheet<br>
-• All messages + filters<br>
-• <b>Timing / frequency analysis</b><br>
-• ID-level breakdown<br>
-• Tx / Rx split sheets
-</div>
-""", unsafe_allow_html=True)
+def circle_polygon(cx, cy, r, npts=48):
+    t = np.linspace(0, 2 * np.pi, npts)
+    return cx + r * np.cos(t), cy + r * np.sin(t)
 
 
-# ─── MAIN ──────────────────────────────────────────────────────────────────────
-if not uploaded:
-    st.markdown("""
-<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
-            min-height:70vh;text-align:center;">
-  <div style="font-size:3rem;margin-bottom:1rem;">🚌</div>
-  <div style="font-size:1.5rem;font-weight:700;color:#e6edf3;margin-bottom:0.5rem;">
-    CAN Bus Log Analyzer
-  </div>
-  <div style="font-size:0.9rem;color:#8b949e;max-width:420px;line-height:1.6;">
-    Upload a <b style="color:#58a6ff;">BUSMASTER .log</b> file using the sidebar.<br>
-    Get message inspection, timing analysis, payload decoding,<br>and a fully formatted Excel report.
-  </div>
-  <div style="margin-top:2rem;display:flex;gap:2rem;font-size:0.8rem;color:#8b949e;">
-    <span>📋 Message Browser</span>
-    <span>⏱️ Timing Analysis</span>
-    <span>📊 ID Breakdown</span>
-    <span>📥 Excel Export</span>
-  </div>
-</div>
-""", unsafe_allow_html=True)
-    st.stop()
+def fmt(v, unit="", dp=3):
+    return f"{v:,.{dp}f}{unit}"
 
 
-# ── Parse ──
-raw = uploaded.read().decode("utf-8", errors="replace")
-with st.spinner("Parsing…"):
-    meta, df = parse_can_log(raw)
+# --------------------------------------------------------------------------- #
+# SIDEBAR — Section 1: controls
+# --------------------------------------------------------------------------- #
+st.sidebar.title("🌱 Project Nandi")
+st.sidebar.caption("Sprayer Coverage Simulator")
 
-if df.empty:
-    st.error("No valid CAN messages found.")
-    st.stop()
+mode = st.sidebar.selectbox("Simulation Mode", ["Static Boom Coverage"])
 
-# ── Sidebar Filters (now that we have data) ──
-with filter_placeholder.container():
-    dir_opts = sorted(df["Direction"].unique().tolist())
-    id_opts  = sorted(df["CAN ID"].unique().tolist())
-    ft_opts  = sorted(df["Frame"].unique().tolist())
-
-    sel_dir = st.multiselect("Direction", dir_opts, default=dir_opts)
-    sel_id  = st.multiselect("CAN ID",    id_opts,  default=id_opts)
-    sel_ft  = st.multiselect("Frame Type",ft_opts,  default=ft_opts)
-
-    ts_range = None
-    if df["Rel Time (ms)"].notna().any():
-        t_min = float(df["Rel Time (ms)"].min())
-        t_max = float(df["Rel Time (ms)"].max())
-        ts_range = st.slider(
-            "Time Window (ms)",
-            min_value=t_min, max_value=t_max,
-            value=(t_min, t_max), step=10.0,
-        )
-
-filt = (
-    df["Direction"].isin(sel_dir) &
-    df["CAN ID"].isin(sel_id) &
-    df["Frame"].isin(sel_ft)
+st.sidebar.header("Global Parameters")
+nozzle_type = st.sidebar.radio("Nozzle Type", ["Flat Fan", "Conical"], horizontal=True)
+boom_height = st.sidebar.slider("Boom Height (mm)", 100, 1500, 500, 10)
+spray_angle = st.sidebar.slider("Spray Angle (°)", 10, 150, 80, 1)
+fan_thickness = st.sidebar.slider(
+    "Fan Pass Thickness (mm)", 10, 400, 80, 5,
+    help="Pass-direction depth of a flat-fan footprint. Ignored for conical nozzles.",
 )
-if ts_range:
-    filt &= (df["Rel Time (ms)"] >= ts_range[0]) & (df["Rel Time (ms)"] <= ts_range[1])
+n_nozzles = st.sidebar.slider("Number of Nozzles", 1, 50, 8, 1)
 
-fdf = df[filt].copy()
+# Single-nozzle ground swath
+swath_w = swath_from_geometry(boom_height, spray_angle)
 
+st.sidebar.header("Spacing Configuration")
+spacing_mode = st.sidebar.radio("Spacing", ["Uniform", "Custom"], horizontal=True)
 
-# ── KPI Row ──
-dur_ms = df["ts_ms"].max() - df["ts_ms"].min() if df["ts_ms"].notna().any() else 0
-dur_s  = dur_ms / 1000
+if spacing_mode == "Uniform":
+    default_sp = max(int(round(swath_w * 0.85)), 20)  # ~15% overlap default
+    spacing = st.sidebar.slider("Nozzle Spacing (mm)", 20, 1200, min(default_sp, 1200), 5)
+    centers = (np.arange(n_nozzles) - (n_nozzles - 1) / 2.0) * spacing
 
-st.markdown(f"""
-<div class="kpi-row">
-  <div class="kpi-card total">
-    <div class="kpi-val">{len(df):,}</div>
-    <div class="kpi-label">Total Messages</div>
-  </div>
-  <div class="kpi-card tx">
-    <div class="kpi-val">{len(df[df["Direction"]=="Tx"]):,}</div>
-    <div class="kpi-label">Transmitted (Tx)</div>
-  </div>
-  <div class="kpi-card rx">
-    <div class="kpi-val">{len(df[df["Direction"]=="Rx"]):,}</div>
-    <div class="kpi-label">Received (Rx)</div>
-  </div>
-  <div class="kpi-card ids">
-    <div class="kpi-val">{df["CAN ID"].nunique()}</div>
-    <div class="kpi-label">Unique CAN IDs</div>
-  </div>
-  <div class="kpi-card ext">
-    <div class="kpi-val">{len(df[df["Frame"]=="Extended"])}</div>
-    <div class="kpi-label">Extended Frames</div>
-  </div>
-  <div class="kpi-card dur">
-    <div class="kpi-val">{round(dur_s,1)}s</div>
-    <div class="kpi-label">Log Duration</div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
-# Active filter notice
-if len(fdf) < len(df):
-    st.markdown(f'<div class="warn-banner">⚠️ Filter active — showing <b>{len(fdf):,}</b> of <b>{len(df):,}</b> messages</div>', unsafe_allow_html=True)
-
-
-# ── Tabs ──
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📋  Messages", "⏱️  Timing", "🔍  ID Breakdown", "📡  Session Info", "📥  Export"
-])
-
-
-# ═══════ TAB 1 — MESSAGES ════════════════════════════════════════════════════
-with tab1:
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        st.markdown(f'<div class="sec-header">CAN Messages &nbsp;<span style="color:#58a6ff;font-weight:700;">{len(fdf):,}</span> rows</div>', unsafe_allow_html=True)
-    with c2:
-        search = st.text_input("🔎 Search CAN ID / Data", placeholder="e.g. 0x302 or 05 00", label_visibility="collapsed")
-
-    if search.strip():
-        mask = (
-            fdf["CAN ID"].str.contains(search.strip(), case=False, na=False) |
-            fdf["Data (Hex)"].str.contains(search.strip(), case=False, na=False)
-        )
-        fdf = fdf[mask]
-        st.caption(f"{len(fdf)} results for `{search}`")
-
-    display_cols = ["Timestamp", "Rel Time (ms)", "Direction", "Channel", "CAN ID", "Frame", "DLC", "Data (Hex)",
-                    "B0","B1","B2","B3","B4","B5","B6","B7"]
-
-    def color_rows(row):
-        if row["Direction"] == "Tx":
-            return ["background-color:#0d2818; color:#3fb950"]*len(row)
-        elif row["Direction"] == "Rx":
-            return ["background-color:#0c1e35; color:#58a6ff"]*len(row)
-        return [""]*len(row)
-
-    def color_frame(val):
-        if val == "Extended": return "color:#d2a8ff; font-weight:600"
-        if val == "Remote":   return "color:#e3b341; font-weight:600"
-        return "color:#c3c3e0"
-
-    styled = (
-        fdf[display_cols]
-        .style
-        .apply(color_rows, axis=1)
-        .map(color_frame, subset=["Frame"])
-        .format({"Rel Time (ms)": "{:.1f}"}, na_rep="—")
+    cfg = pd.DataFrame({
+        "Nozzle": [f"N{i + 1}" for i in range(n_nozzles)],
+        "Active": [True] * n_nozzles,
+    })
+    st.sidebar.caption("Toggle individual nozzles ON / OFF:")
+    edited = st.sidebar.data_editor(
+        cfg, hide_index=True, use_container_width=True, key="cfg_uniform",
+        column_config={
+            "Nozzle": st.column_config.TextColumn(disabled=True, width="small"),
+            "Active": st.column_config.CheckboxColumn(width="small"),
+        },
     )
-    st.dataframe(styled, use_container_width=True, height=460, hide_index=True)
+    active = edited["Active"].to_numpy(dtype=bool)
 
-    # Payload inspector
-    st.markdown('<div class="sec-header" style="margin-top:1.2rem;">🔬 Payload Inspector — Non-Zero Bytes</div>', unsafe_allow_html=True)
-    byte_cols = ["B0","B1","B2","B3","B4","B5","B6","B7"]
-    non_zero_df = fdf[fdf[byte_cols].apply(
-        lambda r: any(v not in ("00","--","") for v in r), axis=1
-    )][["Timestamp","Rel Time (ms)","Direction","CAN ID","Frame","DLC"] + byte_cols]
+else:  # Custom
+    base_sp = max(int(round(swath_w * 0.85)), 20)
+    cfg = pd.DataFrame({
+        "Nozzle": [f"N{i + 1}" for i in range(n_nozzles)],
+        "Gap to prev (mm)": [0] + [base_sp] * (n_nozzles - 1),
+        "Active": [True] * n_nozzles,
+    })
+    st.sidebar.caption("Edit per-nozzle spacing & ON/OFF state:")
+    edited = st.sidebar.data_editor(
+        cfg, hide_index=True, use_container_width=True, key="cfg_custom",
+        column_config={
+            "Nozzle": st.column_config.TextColumn(disabled=True, width="small"),
+            "Gap to prev (mm)": st.column_config.NumberColumn(min_value=0, max_value=2000, step=5),
+            "Active": st.column_config.CheckboxColumn(width="small"),
+        },
+    )
+    gaps = edited["Gap to prev (mm)"].to_numpy(dtype=float)
+    gaps[0] = 0.0
+    positions = np.cumsum(gaps)
+    centers = positions - positions.mean()  # centre the boom on 0
+    active = edited["Active"].to_numpy(dtype=bool)
 
-    if non_zero_df.empty:
-        st.markdown('<div class="info-box">ℹ️ All payloads in current filter are <b>0x00</b>. This is typical for idle/heartbeat messages.</div>', unsafe_allow_html=True)
+# --------------------------------------------------------------------------- #
+# RUN THE ENGINE ONCE (results reused across all tabs)
+# --------------------------------------------------------------------------- #
+cov = compute_coverage(centers, active, nozzle_type, swath_w, fan_thickness)
+radius = swath_w / 2.0
+
+
+# =========================================================================== #
+# MAIN CANVAS
+# =========================================================================== #
+st.title("Sprayer Coverage Simulator")
+st.caption(
+    f"Autonomous weeding & spot-spraying robot · **{nozzle_type}** nozzles · "
+    f"boom @ {boom_height} mm · {spray_angle}° spray angle"
+)
+
+tab_boom, tab_cam, tab_perf = st.tabs(
+    ["🟢 Static Boom Coverage", "📷 Camera FOV & Look-ahead", "🚜 Max Operating Speed"]
+)
+
+# --------------------------------------------------------------------------- #
+# SECTION 2 — Static Boom Coverage
+# --------------------------------------------------------------------------- #
+with tab_boom:
+    st.subheader("Section 2 · Static Boom Coverage")
+
+    if cov["n_active"] == 0:
+        st.warning("All nozzles are OFF — enable at least one nozzle in the sidebar.")
     else:
-        st.caption(f"{len(non_zero_df)} messages with non-zero bytes")
-        st.dataframe(non_zero_df.style.apply(color_rows, axis=1), use_container_width=True, height=280, hide_index=True)
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Active Nozzles", f"{cov['n_active']} / {cov['n_total']}")
+        m2.metric("Swath / Nozzle", f"{swath_w:,.0f} mm")
+        m3.metric("Net Covered Area", f"{cov['union_area_m2']:.3f} m²")
+        m4.metric("Total Overlap Area", f"{cov['overlap_area_m2']:.3f} m²")
+        m5.metric("Overlap %", f"{cov['overlap_pct']:.1f} %")
 
+        # Gap warning
+        if cov["gaps_mm"]:
+            total_gap = sum(g[2] for g in cov["gaps_mm"])
+            st.error(
+                f"⚠️ **Coverage gaps detected:** {len(cov['gaps_mm'])} untreated strip(s), "
+                f"{total_gap:,.0f} mm total width. Crop in these lanes receives no spray."
+            )
+        else:
+            st.success("✅ No horizontal coverage gaps across the active swath.")
 
-# ═══════ TAB 2 — TIMING ══════════════════════════════════════════════════════
-with tab2:
-    st.markdown('<div class="sec-header">⏱️ Per-ID Timing & Frequency Analysis</div>', unsafe_allow_html=True)
+        # ---- Chart 1: Top-down footprint ----
+        st.markdown("**Top-Down · Ground Footprint**")
+        fig_td = go.Figure()
+        if nozzle_type == "Conical":
+            ylo, yhi = -radius, radius
+        else:
+            ylo, yhi = -fan_thickness / 2.0, fan_thickness / 2.0
 
-    ta = timing_analysis(df)
-
-    if ta.empty:
-        st.warning("Not enough data for timing analysis.")
-    else:
-        # Visual timing bars
-        max_mean = ta["Mean (ms)"].max()
-        for _, row in ta.iterrows():
-            pct = int(row["Mean (ms)"] / max_mean * 100) if max_mean > 0 else 0
-            d_color = "#3fb950" if row["Direction"]=="Tx" else "#58a6ff"
-            ft_badge = {"Extended":"ext","Remote":"rem","Standard":"std"}.get(row["Frame"],"std")
-            st.markdown(f"""
-<div class="timing-row">
-  <div class="timing-id" style="color:{d_color};">{row["CAN ID"]}</div>
-  <span class="badge-{ft_badge.lower()}">{row["Frame"]}</span>
-  <div class="timing-bar-wrap">
-    <div class="timing-bar" style="width:{pct}%;background:{d_color};opacity:0.7;"></div>
-  </div>
-  <div class="timing-val">
-    <b style="color:{d_color};">{row["Est. Freq"]}</b>
-    &nbsp;&nbsp;~{row["Mean (ms)"]} ms avg
-  </div>
-  <div style="font-size:0.72rem;color:#8b949e;min-width:80px;">jitter: {row["Jitter (ms)"]} ms</div>
-  <div style="font-size:0.72rem;color:#8b949e;min-width:60px;">{row["Count"]} msgs</div>
-</div>
-""", unsafe_allow_html=True)
-
-        st.markdown('<div class="sec-header" style="margin-top:1.5rem;">📊 Detailed Timing Table</div>', unsafe_allow_html=True)
-
-        def _color_timing(val, max_val, mode="mean"):
-            if max_val == 0 or not isinstance(val, (int, float)): return ""
-            ratio = min(val / max_val, 1.0)
-            if mode == "mean":
-                r = int(30 + ratio*200); g = int(180 - ratio*130); b = 50
+        for i, cx in enumerate(centers):
+            on = bool(active[i])
+            fill = C_ACTIVE if on else C_OFF
+            line = C_ACTIVE_L if on else C_OFF_L
+            if nozzle_type == "Conical":
+                px, py = circle_polygon(cx, 0.0, radius)
             else:
-                r = int(30 + ratio*220); g = int(60 - ratio*40);   b = 50
-            return f"background-color:rgb({r},{g},{b});color:#e6edf3;"
+                px = [cx - radius, cx + radius, cx + radius, cx - radius, cx - radius]
+                py = [ylo, ylo, yhi, yhi, ylo]
+            fig_td.add_trace(go.Scatter(
+                x=px, y=py, fill="toself", mode="lines",
+                line=dict(color=line, width=1.2), fillcolor=fill,
+                name=f"N{i+1}", showlegend=False,
+                hovertemplate=f"N{i+1} · {'ON' if on else 'OFF'}<extra></extra>",
+            ))
 
-        _mm = ta["Mean (ms)"].max()
-        _jm = ta["Jitter (ms)"].max()
+        # gaps as red bands
+        for (gs, ge, gw) in cov["gaps_mm"]:
+            fig_td.add_trace(go.Scatter(
+                x=[gs, ge, ge, gs, gs], y=[ylo, ylo, yhi, yhi, ylo],
+                fill="toself", mode="lines", line=dict(color=C_GAP_L, width=1),
+                fillcolor=C_GAP, name="gap", showlegend=False,
+                hovertemplate=f"GAP {gw:,.0f} mm<extra></extra>",
+            ))
 
-        def _style_ta(row):
-            out = [""] * len(row)
-            for i, c in enumerate(row.index):
-                if c == "Mean (ms)":   out[i] = _color_timing(row[c], _mm, "mean")
-                elif c == "Jitter (ms)": out[i] = _color_timing(row[c], _jm, "jitter")
-            return out
+        fig_td.update_layout(
+            height=320, margin=dict(l=10, r=10, t=10, b=10),
+            plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
+            xaxis_title="Across-boom (mm)", yaxis_title="Pass direction (mm)",
+        )
+        fig_td.update_yaxes(scaleanchor="x", scaleratio=1, zeroline=False)
+        fig_td.update_xaxes(zeroline=False)
+        st.plotly_chart(fig_td, use_container_width=True)
 
-        st.dataframe(
-            ta.style.apply(_style_ta, axis=1)
-                    .format({"Mean (ms)":"{:.2f}","Min (ms)":"{:.2f}","Max (ms)":"{:.2f}",
-                             "Std Dev (ms)":"{:.2f}","Jitter (ms)":"{:.2f}"}),
-            use_container_width=True,
-            hide_index=True,
+        # ---- Chart 2: Front profile (spray cones/triangles) ----
+        st.markdown("**Front-Profile · Spray Cones (boom → ground)**")
+        fig_fp = go.Figure()
+        for i, cx in enumerate(centers):
+            on = bool(active[i])
+            fill = C_ACTIVE if on else C_OFF
+            line = C_ACTIVE_L if on else C_OFF_L
+            fig_fp.add_trace(go.Scatter(
+                x=[cx, cx - radius, cx + radius, cx],
+                y=[boom_height, 0, 0, boom_height],
+                fill="toself", mode="lines",
+                line=dict(color=line, width=1.0), fillcolor=fill,
+                showlegend=False,
+                hovertemplate=f"N{i+1} · {'ON' if on else 'OFF'}<extra></extra>",
+            ))
+        # boom + ground lines
+        xspan = [min(centers) - radius, max(centers) + radius]
+        fig_fp.add_trace(go.Scatter(x=xspan, y=[boom_height, boom_height],
+                                    mode="lines", line=dict(color=C_BOOM, width=4),
+                                    name="Boom", showlegend=False))
+        fig_fp.add_trace(go.Scatter(x=xspan, y=[0, 0], mode="lines",
+                                    line=dict(color=C_GROUND, width=3),
+                                    name="Ground", showlegend=False))
+        fig_fp.update_layout(
+            height=300, margin=dict(l=10, r=10, t=10, b=10),
+            plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
+            xaxis_title="Across-boom (mm)", yaxis_title="Height (mm)",
+        )
+        st.plotly_chart(fig_fp, use_container_width=True)
+
+        # ---- Per-nozzle table with solenoid mapping ----
+        st.markdown("**Per-Nozzle Coverage & Solenoid Channel Map**")
+        rows = []
+        for i, cx in enumerate(centers):
+            ch = i + 1
+            bank = i // 8 + 1
+            ch_in_bank = i % 8 + 1
+            rows.append({
+                "Nozzle": f"N{i+1}",
+                "Center X (mm)": round(cx, 1),
+                "State": "ON" if active[i] else "OFF",
+                "Footprint (m²)": round(cov["per_nozzle"][i], 4),
+                "Unique (m²)": round(cov["unique"][i], 4),
+                "Shared (m²)": round(cov["shared"][i], 4),
+                "Solenoid Ch": f"CH{ch:02d}",
+                "Driver Bank": f"B{bank}.{ch_in_bank}",
+            })
+        df = pd.DataFrame(rows)
+        st.dataframe(df, hide_index=True, use_container_width=True)
+
+        st.caption(
+            f"Raster resolution: {cov['grid_res']:.2f} mm/cell · Raw (summed) "
+            f"footprint area: {cov['raw_area_m2']:.3f} m² · "
+            f"Covered swath span: {cov['covered_x_span_mm']/1000:.3f} m"
         )
 
-        st.markdown('<div class="sec-header" style="margin-top:1rem;">📈 Message Rate Over Time</div>', unsafe_allow_html=True)
-        if df["Rel Time (ms)"].notna().any():
-            bucket_df = df.copy()
-            bucket_df["sec"] = (bucket_df["Rel Time (ms)"] // 500).astype(int)  # 500ms buckets
-            rate_df = bucket_df.groupby(["sec","CAN ID"]).size().unstack(fill_value=0)
-            rate_df.index = rate_df.index * 0.5  # convert to seconds
-            rate_df.index.name = "Time (s)"
-            st.line_chart(rate_df, use_container_width=True, height=220)
+# --------------------------------------------------------------------------- #
+# SECTION 3 — Camera FOV & Look-ahead Geometry
+# --------------------------------------------------------------------------- #
+with tab_cam:
+    st.subheader("Section 3 · Camera FOV & Look-ahead Geometry")
 
-
-# ═══════ TAB 3 — ID BREAKDOWN ════════════════════════════════════════════════
-with tab3:
-    st.markdown('<div class="sec-header">🔍 CAN ID Traffic Breakdown</div>', unsafe_allow_html=True)
-
-    total_msgs = len(df)
-    for cid, grp in df.groupby("CAN ID"):
-        pct = round(len(grp)/total_msgs*100, 1)
-        tx_n = len(grp[grp["Direction"]=="Tx"])
-        rx_n = len(grp[grp["Direction"]=="Rx"])
-        ft   = grp["Frame"].mode()[0] if not grp.empty else "-"
-        unique_pl = grp["Data (Hex)"].nunique()
-        ft_badge = {"Extended":"ext","Remote":"rem","Standard":"std"}.get(ft,"std")
-        d_color  = "#3fb950" if tx_n > rx_n else "#58a6ff"
-
-        with st.expander(f"**{cid}** — {len(grp):,} msgs ({pct}%)  |  {ft}  |  Tx:{tx_n}  Rx:{rx_n}"):
-            ic1, ic2, ic3, ic4 = st.columns(4)
-            ic1.metric("Total",  f"{len(grp):,}")
-            ic2.metric("Tx",     f"{tx_n:,}",  delta=f"{round(tx_n/len(grp)*100)}%")
-            ic3.metric("Rx",     f"{rx_n:,}",  delta=f"{round(rx_n/len(grp)*100)}%")
-            ic4.metric("Unique Payloads", unique_pl)
-
-            # Timing for this ID
-            sub = grp.sort_values("ts_ms")
-            diffs = sub["ts_ms"].diff().dropna()
-            if len(diffs) > 1:
-                st.markdown(f"""
-<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:0.8rem;margin:8px 0;">
-  <span style="color:#8b949e;">Mean interval: <b style="color:#e6edf3;">{diffs.mean():.1f} ms</b></span>
-  <span style="color:#8b949e;">Freq: <b style="color:#3fb950;">{1000/diffs.mean():.1f} Hz</b></span>
-  <span style="color:#8b949e;">Jitter: <b style="color:#e3b341;">{diffs.std():.1f} ms</b></span>
-  <span style="color:#8b949e;">Min: <b style="color:#e6edf3;">{diffs.min():.0f} ms</b></span>
-  <span style="color:#8b949e;">Max: <b style="color:#e6edf3;">{diffs.max():.0f} ms</b></span>
-</div>
-""", unsafe_allow_html=True)
-
-            # Payload preview — byte-level
-            st.markdown("**Payload samples:**")
-            sample = grp[["Timestamp","Direction","Data (Hex)","B0","B1","B2","B3","B4","B5","B6","B7"]].head(8)
-            st.dataframe(sample, use_container_width=True, hide_index=True, height=200)
-
-
-# ═══════ TAB 4 — SESSION INFO ════════════════════════════════════════════════
-with tab4:
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
-        st.markdown('<div class="sec-header">📡 Session Metadata</div>', unsafe_allow_html=True)
-        rows_html = "".join(f"<tr><td>{k}</td><td><b>{v}</b></td></tr>" for k,v in meta.items())
-        st.markdown(f'<table class="meta-table">{rows_html}</table>', unsafe_allow_html=True)
-
+        cam_h = st.slider("Camera Height (mm)", 100, 2000, 900, 10)
+        cam_fwd = st.slider("Forward Offset (mm)", 0, 2000, 600, 10,
+                            help="Camera mounted ahead of the boom by this much.")
     with c2:
-        st.markdown('<div class="sec-header">📊 Frame Type Distribution</div>', unsafe_allow_html=True)
-        ft_counts = df["Frame"].value_counts().reset_index()
-        ft_counts.columns = ["Frame Type", "Count"]
-        ft_counts["% Share"] = (ft_counts["Count"]/len(df)*100).round(1).astype(str) + "%"
-        st.dataframe(ft_counts, hide_index=True, use_container_width=True)
+        cam_lat = st.slider("Lateral Offset (mm)", -1000, 1000, 0, 10)
+        cam_tilt = st.slider("Tilt / Depression (°)", 5, 85, 35, 1,
+                            help="Optical-axis angle below horizontal.")
+    with c3:
+        hfov = st.slider("Horizontal FOV (°)", 20, 120, 70, 1)
+        vfov = st.slider("Vertical FOV (°)", 20, 120, 50, 1)
+    cam_speed = st.slider("Robot Speed (mm/s)", 50, 4000, 800, 10)
 
-        st.markdown('<div class="sec-header" style="margin-top:1rem;">📊 Tx / Rx by CAN ID</div>', unsafe_allow_html=True)
-        txrx = df.groupby(["CAN ID","Direction"]).size().unstack(fill_value=0)
-        st.bar_chart(txrx, use_container_width=True, height=200)
+    # --- look-ahead trigonometry ---
+    # depression angle of upper / lower FOV edges (below horizontal)
+    a_near = cam_tilt + vfov / 2.0     # steepest ray -> nearest ground point
+    a_far = cam_tilt - vfov / 2.0      # shallowest ray -> furthest ground point
 
-    st.markdown('<div class="sec-header" style="margin-top:1rem;">🗂️ All IDs Summary</div>', unsafe_allow_html=True)
-    summary = df.groupby("CAN ID").agg(
-        Count=("CAN ID","count"),
-        Tx=("Direction", lambda x:(x=="Tx").sum()),
-        Rx=("Direction", lambda x:(x=="Rx").sum()),
-        Frame=("Frame", lambda x:x.mode()[0]),
-        Min_DLC=("DLC","min"), Max_DLC=("DLC","max"),
-        First=("Timestamp","first"), Last=("Timestamp","last"),
-        Unique_Payloads=("Data (Hex)","nunique")
-    ).reset_index()
-    summary["% Traffic"] = (summary["Count"]/len(df)*100).round(1).astype(str)+"%"
-    st.dataframe(summary, hide_index=True, use_container_width=True, height=280)
+    a_near = min(a_near, 89.5)
+    far_above_horizon = a_far <= 0.5
 
+    gd_near = cam_h / math.tan(math.radians(a_near))            # from camera ground pt
+    gd_far = (cam_h / math.tan(math.radians(max(a_far, 0.5))))  # from camera ground pt
 
-# ═══════ TAB 5 — EXPORT ══════════════════════════════════════════════════════
-with tab5:
-    st.markdown('<div class="sec-header">📥 Download Excel Report</div>', unsafe_allow_html=True)
+    # measured FROM the boom (boom at Y=0, camera at Y=cam_fwd)
+    L_near = cam_fwd + gd_near
+    L_far = cam_fwd + gd_far
 
-    st.markdown("""
-<div class="info-box">
-The Excel file is built with <b>Consolas monospace font</b>, dark-mode colour coding, freeze-panes on all sheets, and auto-filters. It contains 6 sheets:
-<br><br>
-<b>1. Summary</b> — session metadata + log statistics<br>
-<b>2. All Messages</b> — every frame with relative timestamp + all 8 byte columns<br>
-<b>3. Timing Analysis</b> — per-ID mean/min/max/jitter + estimated frequency (colour-scaled)<br>
-<b>4. ID Breakdown</b> — traffic share, unique payloads, first/last seen<br>
-<b>5. Tx Messages</b> — transmitted frames only<br>
-<b>6. Rx Messages</b> — received frames only
-</div>
-""", unsafe_allow_html=True)
+    t_near = L_near / cam_speed if cam_speed > 0 else float("inf")  # s (mm/(mm/s))
+    t_far = L_far / cam_speed if cam_speed > 0 else float("inf")
 
-    with st.spinner("Building Excel…"):
-        excel_bytes = build_excel(meta, df)
+    g1, g2, g3, g4 = st.columns(4)
+    g1.metric("Near-edge Look-ahead", f"{L_near:,.0f} mm")
+    g2.metric("Far-edge Look-ahead", "∞ (above horizon)" if far_above_horizon else f"{L_far:,.0f} mm")
+    g3.metric("Time-to-boom (near)", f"{t_near*1000:,.0f} ms")
+    g4.metric("FOV Depth Window", "—" if far_above_horizon else f"{(L_far-L_near):,.0f} mm")
 
-    fname = uploaded.name.replace(".log","").replace(".txt","")
-    st.download_button(
-        label="⬇️  Download  " + fname + "_CAN_Analysis.xlsx",
-        data=excel_bytes,
-        file_name=fname + "_CAN_Analysis.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        type="primary",
+    if far_above_horizon:
+        st.warning(
+            "The far FOV edge points at/above the horizon (tilt too shallow for the "
+            "vertical FOV). Far-edge look-ahead is unbounded — increase tilt to bound it."
+        )
+
+    # store for Section 5
+    st.session_state["L_near_mm"] = L_near
+    st.session_state["L_far_mm"] = L_far if not far_above_horizon else None
+
+    # ---- Chart 1: Side view ----
+    st.markdown("**Side-View · Camera FOV projecting forward onto the ground**")
+    fig_side = go.Figure()
+    x_max = (L_far if not far_above_horizon else L_near * 1.6) * 1.1
+    # ground
+    fig_side.add_trace(go.Scatter(x=[-200, x_max], y=[0, 0], mode="lines",
+                                  line=dict(color=C_GROUND, width=3),
+                                  name="Ground", showlegend=False))
+    # boom mast at Y=0
+    fig_side.add_trace(go.Scatter(x=[0, 0], y=[0, boom_height], mode="lines",
+                                  line=dict(color=C_BOOM, width=5),
+                                  name="Boom", showlegend=False))
+    fig_side.add_trace(go.Scatter(x=[0], y=[boom_height], mode="markers+text",
+                                  marker=dict(color=C_BOOM, size=10), text=["Boom"],
+                                  textposition="top center", showlegend=False))
+    # camera + FOV triangle
+    cam_pt = (cam_fwd, cam_h)
+    near_pt = (L_near, 0)
+    far_pt = (L_far if not far_above_horizon else x_max, 0)
+    fig_side.add_trace(go.Scatter(
+        x=[cam_pt[0], near_pt[0], far_pt[0], cam_pt[0]],
+        y=[cam_pt[1], 0, 0, cam_pt[1]],
+        fill="toself", mode="lines", line=dict(color=C_CAM_L, width=1.5),
+        fillcolor=C_CAM, name="FOV", showlegend=False,
+    ))
+    fig_side.add_trace(go.Scatter(x=[cam_fwd], y=[cam_h], mode="markers+text",
+                                  marker=dict(color=C_CAM_L, size=12, symbol="square"),
+                                  text=["Cam"], textposition="top center", showlegend=False))
+    for px, label in [(L_near, "near"), (L_far if not far_above_horizon else None, "far")]:
+        if px is not None:
+            fig_side.add_trace(go.Scatter(x=[px], y=[0], mode="markers+text",
+                                          marker=dict(color=C_CAM_L, size=8),
+                                          text=[label], textposition="bottom center",
+                                          showlegend=False))
+    fig_side.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10),
+                           plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
+                           xaxis_title="Forward distance from boom (mm)",
+                           yaxis_title="Height (mm)")
+    st.plotly_chart(fig_side, use_container_width=True)
+
+    # ---- Chart 2: Top-down FOV trapezoid vs boom width ----
+    st.markdown("**Top-Down · Camera FOV trapezoid vs boom width**")
+    hw_near = gd_near * math.tan(math.radians(hfov / 2.0))
+    hw_far = gd_far * math.tan(math.radians(hfov / 2.0))
+    far_y = L_far if not far_above_horizon else L_near + (L_near - cam_fwd)
+    hw_far_draw = hw_far if not far_above_horizon else hw_near * 1.8
+
+    fig_ftd = go.Figure()
+    # FOV trapezoid
+    fig_ftd.add_trace(go.Scatter(
+        x=[cam_lat - hw_near, cam_lat + hw_near, cam_lat + hw_far_draw, cam_lat - hw_far_draw, cam_lat - hw_near],
+        y=[L_near, L_near, far_y, far_y, L_near],
+        fill="toself", mode="lines", line=dict(color=C_CAM_L, width=1.5),
+        fillcolor=C_CAM, name="FOV footprint", showlegend=False,
+    ))
+    # boom coverage line at Y=0
+    if cov["n_active"] > 0:
+        bx0, bx1 = float(min(centers) - radius), float(max(centers) + radius)
+    else:
+        bx0, bx1 = -500, 500
+    fig_ftd.add_trace(go.Scatter(x=[bx0, bx1], y=[0, 0], mode="lines",
+                                 line=dict(color=C_BOOM, width=6),
+                                 name="Boom width", showlegend=False))
+    fig_ftd.add_trace(go.Scatter(x=[cam_lat], y=[cam_fwd], mode="markers+text",
+                                 marker=dict(color=C_CAM_L, size=12, symbol="square"),
+                                 text=["Cam"], textposition="top center", showlegend=False))
+    fig_ftd.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10),
+                          plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
+                          xaxis_title="Lateral / across-boom (mm)",
+                          yaxis_title="Forward distance from boom (mm)")
+    fig_ftd.update_yaxes(scaleanchor="x", scaleratio=1)
+    st.plotly_chart(fig_ftd, use_container_width=True)
+
+    st.caption(
+        f"Near ground reach (from camera): {gd_near:,.0f} mm · "
+        f"FOV half-width near/far: {hw_near:,.0f}/{hw_far:,.0f} mm. "
+        "Horizontal half-width uses small-angle ground projection (visual approximation)."
     )
 
-    st.markdown('<div class="sec-header" style="margin-top:1.5rem;">📋 Export Preview — Timing Analysis</div>', unsafe_allow_html=True)
-    st.dataframe(timing_analysis(df), hide_index=True, use_container_width=True)
+# --------------------------------------------------------------------------- #
+# SECTION 5 — Maximum Operating Speed
+# --------------------------------------------------------------------------- #
+with tab_perf:
+    st.subheader("Section 5 · Maximum Operating Speed")
+    st.caption(
+        "Give the actuation latency and the look-ahead distance — the simulator "
+        "returns the fastest the robot can drive while still spraying every "
+        "detected weed before it passes under the boom."
+    )
+
+    # ---- Inputs ----
+    with st.container(border=True):
+        i1, i2 = st.columns(2)
+        with i1:
+            latency_ms = st.number_input(
+                "Total actuation latency (ms)",
+                min_value=1.0, max_value=2000.0, value=120.0, step=5.0,
+                help="Full pipeline: capture → detect → decide → valve fully open.",
+            )
+        with i2:
+            cam_la = st.session_state.get("L_near_mm", None)
+            use_cam = st.toggle(
+                "Use camera look-ahead (Section 3)",
+                value=False, disabled=cam_la is None,
+                help="Pull the near-edge look-ahead computed in the Camera tab.",
+            )
+            if use_cam and cam_la:
+                look_mm = float(cam_la)
+                st.number_input("Look-ahead distance (mm)",
+                                value=round(look_mm, 1), disabled=True)
+            else:
+                look_mm = st.number_input(
+                    "Look-ahead distance (mm)",
+                    min_value=10.0, max_value=10000.0,
+                    value=float(round(cam_la)) if cam_la else 600.0, step=10.0,
+                    help="Distance from the boom to where a weed is first detected.",
+                )
+
+    # ---- Core result:  V = look-ahead / latency   (mm/ms == m/s) ----
+    v_max_ms = look_mm / latency_ms if latency_ms > 0 else 0.0
+    v_max_kmh = v_max_ms * 3.6
+
+    with st.container(border=True):
+        st.markdown("#### 🚜 Maximum operating speed")
+        r1, r2 = st.columns(2)
+        r1.metric("Vmax", f"{v_max_ms:.2f} m/s")
+        r2.metric("Vmax", f"{v_max_kmh:.2f} km/h")
+        st.caption(
+            f"V = look-ahead ÷ latency = {look_mm:,.0f} mm ÷ {latency_ms:.0f} ms. "
+            "At this speed a weed seen at the look-ahead line reaches the boom "
+            "exactly as the nozzle fires — so run a little below it for margin."
+        )
+
+    # ---- Sensitivity: how Vmax moves with latency (fixed look-ahead) ----
+    st.markdown("**Max speed vs. latency** (at the current look-ahead)")
+    lat_axis = np.linspace(max(latency_ms * 0.3, 5.0), latency_ms * 2.0, 80)
+    v_axis_kmh = (look_mm / lat_axis) * 3.6
+
+    fig_v = go.Figure()
+    fig_v.add_trace(go.Scatter(
+        x=lat_axis, y=v_axis_kmh, mode="lines",
+        line=dict(color=C_CAM_L, width=2.5),
+        fill="tozeroy", fillcolor="rgba(30,110,200,0.10)", showlegend=False,
+    ))
+    fig_v.add_trace(go.Scatter(
+        x=[latency_ms], y=[v_max_kmh], mode="markers+text",
+        marker=dict(color=C_ACTIVE_L, size=13),
+        text=[f"  {v_max_kmh:.1f} km/h"], textposition="middle right",
+        showlegend=False,
+    ))
+    fig_v.update_layout(
+        height=300, margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
+        xaxis_title="Latency (ms)", yaxis_title="Max speed (km/h)",
+    )
+    fig_v.update_xaxes(zeroline=False)
+    fig_v.update_yaxes(zeroline=False)
+    st.plotly_chart(fig_v, use_container_width=True)
+
+
+st.sidebar.divider()
+st.sidebar.caption("Engine: rasterized union/overlap/gap · areas in m² · grid auto-scaled.")
