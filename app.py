@@ -22,7 +22,7 @@ import streamlit as st
 # Page + lightweight theme tokens (kept consistent across all Plotly charts)
 # --------------------------------------------------------------------------- #
 st.set_page_config(
-    page_title="Sprayer Coverage Simulator",
+    page_title="Project Nandi — Sprayer Coverage Simulator",
     page_icon="🌱",
     layout="wide",
 )
