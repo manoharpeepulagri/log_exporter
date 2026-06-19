@@ -1,0 +1,6 @@
+dependencies = [
+    "streamlit",
+    "numpy",
+    "pandas",
+    "plotly"
+]
