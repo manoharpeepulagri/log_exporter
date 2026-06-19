@@ -1,3 +1,6 @@
+[project]
+name = "log-exporter"
+version = "0.1.0"
 dependencies = [
     "streamlit",
     "numpy",
